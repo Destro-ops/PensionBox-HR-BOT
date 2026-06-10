@@ -1,6 +1,6 @@
 # PensionBox HR Bot — v1
 
-RAG-based internal HR chatbot. Employees ask questions in Slack, the bot searches your HR policy documents and answers using Claude.
+RAG-based internal HR chatbot. Employees ask questions in Slack, the bot searches your HR policy documents and answers using openai's gpt. 
 
 ---
 
@@ -130,5 +130,5 @@ python slack_bot/app.py
 
 Employee in Slack → Slack Bot → POST /ask → FastAPI
 → Embed question → FAISS top-5 search
-→ Chunks + question → Claude
+→ Chunks + question → gpt-4o-mini
 → Answer + sources → Slack reply
