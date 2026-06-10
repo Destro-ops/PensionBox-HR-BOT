@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-
+import sys
 from api.rag import rag_engine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(message)s")
@@ -89,7 +89,7 @@ def reindex():
     try:
         log.info("Reindex triggered...")
         result = subprocess.run(
-            ["python", "-m", "ingest.build_index"],
+            [sys.executable, "-m", "ingest.build_index"],
             capture_output=True,
             text=True,
             timeout=300,
