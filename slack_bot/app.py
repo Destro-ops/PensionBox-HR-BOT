@@ -9,7 +9,9 @@ Run with:
     python slack_bot/app.py
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import threading
+import schedule
+import time
 import requests
 import os
 import logging
@@ -108,6 +110,8 @@ Examples of how to think:
 - "next week" → Monday to Friday of next week
 - "last 3 days" → the 3 most recent weekdays including today
 - "12th june" → just that date if it's a weekday
+- "this month" → all weekdays from the 1st of the current month to today
+- "last month" → all weekdays of the previous month
 - no date mentioned → just today
 
 Current date: {today}
@@ -115,7 +119,7 @@ Day of week: {date.today().strftime('%A')}"""
             },
             {"role": "user", "content": text}
         ],
-        max_tokens=100,
+        max_tokens=300,
         temperature=0.2
     )
     
@@ -145,7 +149,7 @@ def handle_mention(event, say, client):
     try:
         intent = detect_intent(question)
         if intent == "duration":
-          say(get_work_durations())
+          say(get_work_durations(question))
         elif intent == "leave":
           say(get_leave_status(question))
         elif intent == "discrepancy":
@@ -180,7 +184,7 @@ def handle_dm(event, say, client):
     try:
         intent = detect_intent(question)
         if intent == "duration":
-          say(get_work_durations())
+          say(get_work_durations(question))
         elif intent == "leave":
           say(get_leave_status(question))
         elif intent == "discrepancy":
@@ -205,35 +209,58 @@ def get_we360_token() -> str:
     resp.raise_for_status()
     return resp.json()["access_token"]
 
-def get_work_durations() -> str:
-    token = get_we360_token()  # fetches fresh token each time
+def get_work_durations(question: str = "") -> str:
+    target_dates = extract_dates(question)
+    token = get_we360_token()
     url = os.environ["WE360_API_URL"]
     
-    payload = {
-       "start_date": f"{date.today().isoformat()}T00:00:00",
-       "end_date": f"{date.today().isoformat()}T23:59:59",
-       "mode": "detailed",
-       "columns": ["first_name", "last_name", "active_duration", "productive_percent", "active_duration"],
-       "limit": 100,
-       "page": 1
-    }
-    headers = {"Authorization": f"Bearer {token}"}
+    all_results = {}  # {date: [employees]}
     
-    results = []
-    while True:
-        r = requests.post(url, json=payload, headers=headers)
-        print(r.status_code, r.json())
-        r.raise_for_status()
-        data = r.json()
-        results.extend(data["data"])
-        if not data["pagination"]["has_next"]:
-            break
-        payload["page"] += 1
+    for target_date in target_dates:
+        payload = {
+            "start_date": f"{target_date}T00:00:00",
+            "end_date": f"{target_date}T23:59:59",
+            "mode": "detailed",
+            "columns": ["first_name", "active_duration", "productive_percent"],
+            "limit": 100,
+            "page": 1
+        }
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        results = []
+        while True:
+            r = requests.post(url, json=payload, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            results.extend(data["data"])
+            if not data["pagination"]["has_next"]:
+                break
+            payload["page"] += 1
+        
+        all_results[target_date] = results
     
-    lines = [f"• {e['first_name']} {e['last_name']}: ({e['productive_percent']}%), {e['active_duration']}"
-             for e in results]
-    return f"*Work durations for {date.today().strftime('%d %b %Y')}:*\n" + "\n".join(lines)
-
+    # Send to GPT to analyze and answer the actual question
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": """You are an HR analyst. Analyze employee productivity data and answer the HR's question directly.
+Be concise. Use employee first names only.
+If asked for highest/lowest, rank them clearly.
+If asked for a summary, give a clean overview.
+Format nicely for Slack."""
+            },
+            {
+                "role": "user",
+                "content": f"Question: {question}\n\nData:\n{json.dumps(all_results, indent=2)}"
+            }
+        ],
+        max_tokens=800,
+        temperature=0.2
+    )
+    
+    return response.choices[0].message.content
 
 
 
@@ -263,7 +290,21 @@ def fetch_employee_date(emp, target_date):
 
 
 def get_leave_status(question: str = "") -> str:
-    target_dates = extract_dates(question)
+    # If question implies ranking/aggregation, default to current month weekdays
+    aggregation_keywords = ["most", "least", "highest", "lowest", "top", "maximum", "minimum", "rank"]
+    if any(kw in question.lower() for kw in aggregation_keywords):
+        from datetime import timedelta
+        today = date.today()
+        start = today.replace(day=1)
+        target_dates = []
+        d = start
+        while d <= today:
+            if d.weekday() < 5:
+                target_dates.append(d.isoformat())
+            d += timedelta(days=1)
+    else:
+        target_dates = extract_dates(question)
+
     print("target_dates:", target_dates)
     
     with open("data/employees.json", "r") as f:
@@ -280,16 +321,22 @@ def get_leave_status(question: str = "") -> str:
     
     print("results:", results)
     
-    lines = []
-    for d in target_dates:
-        lines.append(f"\n*📅 {d}*")
-        for name, status, leave in sorted(results.get(d, []), key=lambda x: x[0]):
-            lines.append(f"• {name}: {status} — {leave}" if leave else f"• {name}: {status}")
-    
-    if not any(results.values()):
-        return "*Leave records:*\nNo records found for the requested dates."
-    
-    return "*Leave records:*" + "\n".join(lines)
+    leave_count: dict[str, int] = {}
+    for d, records in results.items():
+        for name, status, leave in records:
+            if status and any(s in status.lower() for s in ["leave"]):
+                leave_count[name] = leave_count.get(name, 0) + 1
+
+    if not leave_count:
+        return "*Leave records:*\nNo leaves taken in the requested period."
+
+    sorted_leaves = sorted(leave_count.items(), key=lambda x: x[1], reverse=True)
+
+    lines = ["*🏖️ Leave count:*"]
+    for name, count in sorted_leaves:
+        lines.append(f"• {name}: {count} day{'s' if count > 1 else ''}")
+
+    return "\n".join(lines)
 
 
 def get_raw_leave_data(target_date: str) -> dict:
@@ -372,25 +419,29 @@ def get_discrepancies(question: str = "") -> str:
     we360_data = get_raw_we360_data(target_date)
     
     # Merge both datasets
+   # Merge both datasets — only include employees tracked by we360
     merged = []
     for email, leave in leave_data.items():
-        first = leave["name"].split()[0].lower()
-        activity = we360_data.get(first, {})
-        merged.append({
-          "name": leave["name"],
-          "date": target_date,
-          "leave_status": leave["status"],
-          "leave_type": leave["leave_type"],
-          "active_duration": activity.get("active_duration", "unavailable"),
-          "productive_percent": activity.get("productive_percent", "unavailable")
+      first = leave["name"].split()[0].lower()
+      activity = we360_data.get(first, {})
+    
+      if not activity:  # skip employees not in we360
+        continue
+    
+      merged.append({
+         "name": leave["name"],
+         "date": target_date,
+         "leave_status": leave["status"],
+         "leave_type": leave["leave_type"],
+         "active_duration": activity.get("active_duration", "unavailable"),
+         "productive_percent": activity.get("productive_percent", "unavailable")
     })
     
     # Send to GPT
     response = openai_client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {
-                "role": "system",
+            {   "role": "system",
                 "content": """You are an HR analyst. Analyze employee attendance and activity data and flag discrepancies.
 
 Flag these cases:
@@ -418,12 +469,31 @@ Be concise and clear."""
     
     return f"*🚨 Attendance Discrepancy Report — {target_date}*\n\n" + response.choices[0].message.content
 
+def post_daily_discrepancy_report():
+    try:
+        report = get_discrepancies()
+        from slack_sdk import WebClient
+        client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+        client.chat_postMessage(
+            channel=os.environ["SLACK_ANNOUNCEMENT_CHANNEL"],
+            text=report
+        )
+        log.info("Daily discrepancy report posted.")
+    except Exception as e:
+        log.error(f"Failed to post daily report: {e}", exc_info=True)
+
+def run_scheduler():
+    schedule.every().day.at("14:40").do(post_daily_discrepancy_report)
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
 
 
 
 
 
 if __name__ == "__main__":
+    threading.Thread(target=run_scheduler, daemon=True).start()
     log.info("Starting PensionBox HR Bot...")
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
