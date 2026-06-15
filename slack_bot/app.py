@@ -483,7 +483,7 @@ def post_daily_discrepancy_report():
         log.error(f"Failed to post daily report: {e}", exc_info=True)
 
 def run_scheduler():
-    schedule.every().day.at("14:40").do(post_daily_discrepancy_report)
+    schedule.every().day.at("15:28").do(post_daily_discrepancy_report)
     while True:
         schedule.run_pending()
         time.sleep(60)
