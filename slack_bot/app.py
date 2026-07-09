@@ -62,7 +62,7 @@ def detect_intent(text: str) -> str:
                 "role": "system",
                "content": """Classify the user's message into one of these intents:
 - "leave" → asking about leave status, who is on leave, attendance records
-- "duration" → asking about work hours, active duration, how long someone worked, productive percent, productivity, performance metrics
+- "duration" → asking about work hours, active duration, how long someone worked, productive percent, productivity, performance metrics, employee statistics
 - "discrepancy" → asking about anomalies, mismatches, attendance issues, who didn't show up, work discrepancies
 - "hr_policy" → anything else related to HR policies, benefits, salary, general HR questions
 
@@ -148,6 +148,10 @@ def handle_mention(event, say, client):
 
     try:
         intent = detect_intent(question)
+        AUTHORIZED_IDS = os.environ.get("AUTHORIZED_USER_IDS", "").split(",")
+        if intent in ["duration", "leave", "discrepancy"] and user_id not in AUTHORIZED_IDS:
+            say("Sorry, you are not authorized to access this information.")
+            return
         if intent == "duration":
           say(get_work_durations(question))
         elif intent == "leave":
@@ -183,6 +187,11 @@ def handle_dm(event, say, client):
 
     try:
         intent = detect_intent(question)
+        AUTHORIZED_IDS = os.environ.get("AUTHORIZED_USER_IDS", "").split(",")
+        print(f"Detected intent: {intent}, user_id: {user_id}, authorized_ids: {AUTHORIZED_IDS}")
+        if intent in ["duration", "leave", "discrepancy"] and user_id not in AUTHORIZED_IDS:
+            say("Sorry, you are not authorized to access this information.")
+            return
         if intent == "duration":
           say(get_work_durations(question))
         elif intent == "leave":
@@ -474,11 +483,15 @@ def post_daily_discrepancy_report():
         report = get_discrepancies()
         from slack_sdk import WebClient
         client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
-        client.chat_postMessage(
-            channel=os.environ["SLACK_ANNOUNCEMENT_CHANNEL"],
-            text=report
-        )
-        log.info("Daily discrepancy report posted.")
+        
+        AUTHORIZED_IDS = os.environ.get("AUTHORIZED_USER_IDS", "").split(",")
+        for user_id in AUTHORIZED_IDS:
+            if user_id.strip():
+                client.chat_postMessage(
+                    channel=user_id.strip(),  # sending to user_id directly opens a DM
+                    text=report
+                )
+        log.info("Daily discrepancy report sent to authorized users.")
     except Exception as e:
         log.error(f"Failed to post daily report: {e}", exc_info=True)
 
